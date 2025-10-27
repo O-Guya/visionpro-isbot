@@ -29,13 +29,17 @@ def main():
                         help='Vision Pro IP address (e.g., 10.31.181.201)')
     parser.add_argument('--no_gui', action='store_true',
                         help='Run without GUI (faster)')
-    parser.add_argument('--position_scale', type=float, default=0.5,
-                        help='Position scaling factor (default: 0.5)')
+    parser.add_argument('--position_scale', type=float, default=2.5,
+                        help='Position scaling factor (default: 2.5, higher=robot moves more)')
     parser.add_argument('--workspace_offset', type=float, nargs=3,
                         default=[0.5, 0.3, 0.5],
                         help='Workspace offset [x y z] (default: 0.5 0.3 0.5)')
     parser.add_argument('--kinova_urdf', type=str, default=None,
                         help='Path to Kinova URDF file (optional)')
+    parser.add_argument('--control_freq', type=float, default=100,
+                        help='Control loop frequency in Hz (default: 100)')
+    parser.add_argument('--no_head_relative', action='store_true',
+                        help='Disable head-relative control mode')
     args = parser.parse_args()
 
     print("="*60)
@@ -44,6 +48,8 @@ def main():
     print(f"Vision Pro IP: {args.vp_ip}")
     print(f"Position scale: {args.position_scale}")
     print(f"Workspace offset: {args.workspace_offset}")
+    print(f"Control frequency: {args.control_freq} Hz")
+    print(f"Head-relative mode: {'OFF' if args.no_head_relative else 'ON'}")
     print(f"GUI mode: {'OFF' if args.no_gui else 'ON'}")
     print("="*60)
 
@@ -90,9 +96,12 @@ def main():
     print("\nInitializing motion mapper...")
     mapper = SimpleMotionMapper(
         position_scale=args.position_scale,
-        workspace_offset=np.array(args.workspace_offset)
+        workspace_offset=np.array(args.workspace_offset),
+        use_head_relative=not args.no_head_relative
     )
     print("✓ Motion mapper initialized")
+    if not args.no_head_relative:
+        print("  Head-relative control mode enabled")
 
     print("\n" + "="*60)
     print("READY FOR TELEOPERATION")
@@ -108,7 +117,7 @@ def main():
     print("="*60 + "\n")
 
     # Teleoperation loop
-    loop_rate = 100  # Hz
+    loop_rate = args.control_freq  # Hz (configurable)
     dt = 1.0 / loop_rate
     emergency_stopped = False
 
@@ -162,6 +171,8 @@ def main():
                         robot_cmd["orientation"],
                         length=0.1
                     )
+                    # Update gripper visualization
+                    sim.update_gripper_visualization(robot_cmd["gripper"])
 
             # Step simulation
             sim.step()

@@ -10,20 +10,28 @@ from scipy.spatial.transform import Rotation
 class SimpleMotionMapper:
     """Simple direct pose mapping from Vision Pro to Kinova robot."""
 
-    def __init__(self, position_scale=0.5, workspace_offset=None):
+    def __init__(self, position_scale=2.5, workspace_offset=None, use_head_relative=True):
         """
         Initialize the motion mapper.
 
         Args:
-            position_scale: Scale factor for position mapping (default: 0.5)
-                           e.g., hand moves 1m -> robot moves 0.5m
+            position_scale: Scale factor for position mapping (default: 2.5)
+                           e.g., hand moves 0.2m -> robot moves 0.5m
+                           Higher value = robot moves more for same hand movement
             workspace_offset: Offset to center of robot workspace [x, y, z]
                              (default: [0.5, 0.3, 0.5])
+            use_head_relative: If True, use head position as reference for hand control
+                              This allows user to stand anywhere and control relative to head
         """
         self.control_enabled = False
         self.speed_scale = 1.0
         self.position_scale = position_scale
         self.workspace_offset = workspace_offset if workspace_offset is not None else np.array([0.5, 0.3, 0.5])
+
+        # Head-relative control
+        self.use_head_relative = use_head_relative
+        self.head_reference_pos = None  # Will be set when control is enabled
+        self.hand_reference_pos = None  # Initial hand position when control starts
 
         # For detecting pinch events (state tracking)
         self.last_left_pinch = False
@@ -31,6 +39,7 @@ class SimpleMotionMapper:
 
         # Fine control mode
         self.fine_control_mode = False
+        self.default_position_scale = position_scale  # Store original scale
 
     def detect_fist(self, finger_matrices):
         """
@@ -144,7 +153,21 @@ class SimpleMotionMapper:
         # Toggle control on/off with left hand pinch
         if left_pinch_event:
             self.control_enabled = not self.control_enabled
-            print(f"Control {'ENABLED' if self.control_enabled else 'DISABLED'}")
+            if self.control_enabled:
+                # Initialize reference positions when control is enabled
+                if self.use_head_relative:
+                    self.head_reference_pos = vp_data['head'][0, :3, 3].copy()
+                    right_wrist_abs = vp_data['right_wrist'][0, :3, 3]
+                    self.hand_reference_pos = right_wrist_abs.copy()
+                    print(f"Control ENABLED (Head-relative mode)")
+                    print(f"  Head reference: {self.head_reference_pos}")
+                    print(f"  Hand reference: {self.hand_reference_pos}")
+                else:
+                    print("Control ENABLED (Absolute mode)")
+            else:
+                print("Control DISABLED")
+                self.head_reference_pos = None
+                self.hand_reference_pos = None
 
         # Emergency stop with left hand open
         if left_open:
@@ -161,20 +184,31 @@ class SimpleMotionMapper:
                 print("Fine control mode ENABLED")
                 self.fine_control_mode = True
             self.speed_scale = 0.3
-            self.position_scale = 0.2
+            self.position_scale = self.default_position_scale * 0.4  # 40% of default scale
         else:
             if self.fine_control_mode:
                 print("Fine control mode DISABLED")
                 self.fine_control_mode = False
             self.speed_scale = 1.0
-            self.position_scale = 0.5
+            self.position_scale = self.default_position_scale
 
         # === Right hand position mapping ===
         right_wrist = vp_data['right_wrist'][0]  # Shape: (4, 4)
         right_wrist_pos = right_wrist[:3, 3]  # Extract position [x, y, z]
 
-        # Apply scaling and offset
-        target_position = right_wrist_pos * self.position_scale + self.workspace_offset
+        if self.use_head_relative and self.head_reference_pos is not None:
+            # Head-relative control: compute hand position relative to head
+            head_pos = vp_data['head'][0, :3, 3]
+
+            # Current hand position relative to current head position
+            hand_relative_to_head = right_wrist_pos - head_pos
+
+            # Apply scaling to the relative displacement
+            # This means small hand movements create larger robot movements
+            target_position = hand_relative_to_head * self.position_scale + self.workspace_offset
+        else:
+            # Absolute control (original behavior)
+            target_position = right_wrist_pos * self.position_scale + self.workspace_offset
 
         # === Right hand orientation mapping ===
         right_wrist_rotation = right_wrist[:3, :3]  # Extract 3x3 rotation matrix
