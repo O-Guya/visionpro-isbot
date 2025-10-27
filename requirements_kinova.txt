@@ -1,0 +1,15 @@
+# Requirements for Vision Pro to Kinova teleoperation
+
+# Core dependencies (already in project)
+numpy>=1.20.0
+grpcio>=1.45.0
+protobuf>=3.19.0
+
+# PyBullet for simulation
+pybullet>=3.2.5
+
+# Scipy for rotation conversions
+scipy>=1.7.0
+
+# Optional but recommended
+matplotlib>=3.5.0  # For debugging and visualization
