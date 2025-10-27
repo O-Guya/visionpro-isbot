@@ -18,32 +18,58 @@ Controls:
 import argparse
 import time
 import numpy as np
+import threading
 from avp_stream import VisionProStreamer
 from kinova_is_sim import KinovaSimulator, KinovaController, SimpleMotionMapper
 
 
+def calibrate_workspace(vp_streamer, mapper):
+    """
+    6-point calibration: record hand workspace boundaries.
+    """
+    print("\n" + "="*60)
+    print("WORKSPACE CALIBRATION (6 points)")
+    print("="*60)
+
+    calibration_points = [
+        ("x_max", "Move hand to FRONT (maximum forward), press Enter"),
+        ("x_min", "Move hand to BACK (maximum backward), press Enter"),
+        ("y_max", "Move hand to RIGHT (maximum right), press Enter"),
+        ("y_min", "Move hand to LEFT (maximum left), press Enter"),
+        ("z_max", "Move hand to TOP (maximum up), press Enter"),
+        ("z_min", "Move hand to BOTTOM (maximum down), press Enter"),
+    ]
+
+    for point_name, instruction in calibration_points:
+        print(f"\n{instruction}")
+        input()
+        data = vp_streamer.latest
+        hand_pos = data['right_wrist'][0, :3, 3]
+        mapper.set_calibration_point(point_name, hand_pos)
+        print(f"✓ Recorded {point_name}: {hand_pos}")
+
+    mapper.finish_calibration()
+    print("\n" + "="*60 + "\n")
+
+
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Vision Pro to Kinova teleoperation')
+    parser = argparse.ArgumentParser(description='Vision Pro to Kinova teleoperation with calibration')
     parser.add_argument('--vp_ip', type=str, required=True,
                         help='Vision Pro IP address (e.g., 10.31.181.201)')
     parser.add_argument('--no_gui', action='store_true',
-                        help='Run without GUI (faster)')
-    parser.add_argument('--position_scale', type=float, default=0.5,
-                        help='Position scaling factor (default: 0.5)')
-    parser.add_argument('--workspace_offset', type=float, nargs=3,
-                        default=[0.5, 0.3, 0.5],
-                        help='Workspace offset [x y z] (default: 0.5 0.3 0.5)')
+                        help='Run without GUI')
     parser.add_argument('--kinova_urdf', type=str, default=None,
                         help='Path to Kinova URDF file (optional)')
+    parser.add_argument('--control_freq', type=float, default=100,
+                        help='Control loop frequency in Hz (default: 100)')
     args = parser.parse_args()
 
     print("="*60)
-    print("Vision Pro to Kinova Teleoperation")
+    print("Vision Pro to Kinova Teleoperation (Calibration Mode)")
     print("="*60)
     print(f"Vision Pro IP: {args.vp_ip}")
-    print(f"Position scale: {args.position_scale}")
-    print(f"Workspace offset: {args.workspace_offset}")
+    print(f"Control frequency: {args.control_freq} Hz")
     print(f"GUI mode: {'OFF' if args.no_gui else 'ON'}")
     print("="*60)
 
@@ -88,57 +114,75 @@ def main():
 
     # Initialize motion mapper
     print("\nInitializing motion mapper...")
-    mapper = SimpleMotionMapper(
-        position_scale=args.position_scale,
-        workspace_offset=np.array(args.workspace_offset)
-    )
+    mapper = SimpleMotionMapper()
     print("✓ Motion mapper initialized")
 
+    # Run calibration
+    calibrate_workspace(vp_streamer, mapper)
+
     print("\n" + "="*60)
-    print("READY FOR TELEOPERATION")
+    print("KEYBOARD CONTROLS")
     print("="*60)
-    print("\nControls:")
-    print("  • Left hand PINCH: Enable/disable control")
-    print("  • Left hand OPEN: Emergency stop")
-    print("  • Left hand FIST: Fine control mode")
-    print("  • Right hand POSITION: Control robot position")
-    print("  • Right hand ORIENTATION: Control robot orientation")
-    print("  • Right hand PINCH: Control gripper")
-    print("\nPress Ctrl+C to exit")
+    print("  [Space] - Enable/Disable control")
+    print("  [F]     - Toggle fine control mode")
+    print("  [Q/Esc] - Emergency stop & exit")
+    print("  [C]     - Re-calibrate workspace")
+    print("\n  Right hand: Control robot position/orientation")
+    print("  Right pinch: Control gripper")
     print("="*60 + "\n")
 
+    # Keyboard state
+    keyboard_state = {'exit': False, 'recalibrate': False}
+
+    def keyboard_listener():
+        """Simple keyboard input handler in separate thread."""
+        while not keyboard_state['exit']:
+            try:
+                key = input()  # Blocking, but in separate thread
+                key = key.lower().strip()
+
+                if key in ['q', 'esc']:
+                    keyboard_state['exit'] = True
+                    print("\n[Q] Emergency stop & exit")
+                elif key == ' ' or key == 'space':
+                    mapper.control_enabled = not mapper.control_enabled
+                    print(f"\n[Space] Control {'ENABLED' if mapper.control_enabled else 'DISABLED'}")
+                elif key == 'f':
+                    mapper.fine_control_mode = not mapper.fine_control_mode
+                    print(f"\n[F] Fine control mode {'ON' if mapper.fine_control_mode else 'OFF'}")
+                elif key == 'c':
+                    keyboard_state['recalibrate'] = True
+                    print("\n[C] Re-calibration requested")
+            except:
+                pass
+
+    # Start keyboard listener thread
+    kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    kb_thread.start()
+
     # Teleoperation loop
-    loop_rate = 100  # Hz
+    loop_rate = args.control_freq
     dt = 1.0 / loop_rate
-    emergency_stopped = False
 
     try:
-        while True:
+        while not keyboard_state['exit']:
             loop_start = time.time()
+
+            # Handle re-calibration request
+            if keyboard_state['recalibrate']:
+                mapper.control_enabled = False
+                calibrate_workspace(vp_streamer, mapper)
+                keyboard_state['recalibrate'] = False
+                continue
 
             # Get Vision Pro data
             vp_data = vp_streamer.latest
-
             if vp_data is None:
-                print("Warning: No Vision Pro data")
                 time.sleep(dt)
                 continue
 
             # Map to robot command
             robot_cmd = mapper.map_to_robot(vp_data)
-
-            # Handle emergency stop
-            if robot_cmd is not None and robot_cmd.get("emergency_stop", False):
-                if not emergency_stopped:
-                    controller.stop()
-                    emergency_stopped = True
-                    print("⚠️  EMERGENCY STOP ACTIVATED")
-                time.sleep(dt)
-                continue
-            else:
-                if emergency_stopped:
-                    emergency_stopped = False
-                    print("✓ Emergency stop released")
 
             # Execute robot command
             if robot_cmd is not None:
@@ -162,6 +206,8 @@ def main():
                         robot_cmd["orientation"],
                         length=0.1
                     )
+                    # Update gripper visualization
+                    sim.update_gripper_visualization(robot_cmd["gripper"])
 
             # Step simulation
             sim.step()

@@ -54,7 +54,15 @@ class KinovaSimulator:
         self.end_effector_link_index = None
         self.kinova_urdf_path = kinova_urdf_path
 
+        # Gripper visualization
+        self.gripper_visual_ids = []
+        self.gui_mode = gui
+
         self._load_kinova()
+
+        # Add gripper visualization after robot is loaded
+        if gui:
+            self._create_gripper_visualization()
 
     def _load_kinova(self):
         """Load Kinova robot model."""
@@ -243,3 +251,83 @@ class KinovaSimulator:
     def get_end_effector_link_index(self):
         """Get end effector link index."""
         return self.end_effector_link_index
+
+    def _create_gripper_visualization(self):
+        """Create visual representation of gripper fingers."""
+        if not self.gui_mode or self.robot_id is None:
+            return
+
+        # Create two simple boxes to represent gripper fingers
+        # Left finger
+        left_finger_visual = p.createVisualShape(
+            shapeType=p.GEOM_BOX,
+            halfExtents=[0.01, 0.03, 0.06],  # thin, wide, long
+            rgbaColor=[0.2, 0.2, 0.8, 0.8]  # Blue, semi-transparent
+        )
+
+        # Right finger
+        right_finger_visual = p.createVisualShape(
+            shapeType=p.GEOM_BOX,
+            halfExtents=[0.01, 0.03, 0.06],
+            rgbaColor=[0.2, 0.2, 0.8, 0.8]
+        )
+
+        # Create multi-bodies for fingers (no collision, visual only)
+        left_finger = p.createMultiBody(
+            baseMass=0,
+            baseVisualShapeIndex=left_finger_visual,
+            basePosition=[0, 0, 0]
+        )
+
+        right_finger = p.createMultiBody(
+            baseMass=0,
+            baseVisualShapeIndex=right_finger_visual,
+            basePosition=[0, 0, 0]
+        )
+
+        self.gripper_visual_ids = [left_finger, right_finger]
+        print(f"✓ Gripper visualization created (IDs: {self.gripper_visual_ids})")
+
+    def update_gripper_visualization(self, gripper_state=0.5):
+        """
+        Update gripper visualization position and opening.
+
+        Args:
+            gripper_state: 0.0 = fully closed, 1.0 = fully open
+        """
+        if not self.gripper_visual_ids or self.end_effector_link_index is None:
+            return
+
+        # Get end effector position and orientation
+        link_state = p.getLinkState(self.robot_id, self.end_effector_link_index)
+        ee_pos = np.array(link_state[0])  # World position
+        ee_ori = link_state[1]  # World orientation (quaternion)
+
+        # Convert quaternion to rotation matrix
+        rot_matrix = np.array(p.getMatrixFromQuaternion(ee_ori)).reshape(3, 3)
+
+        # Gripper opening width (0.0 to 0.08 meters)
+        max_opening = 0.08  # 8cm max opening
+        opening_width = gripper_state * max_opening
+
+        # Calculate finger positions (offset from end effector)
+        # Assume gripper opens along Y axis
+        forward_offset = rot_matrix[:, 2] * 0.08  # 8cm forward along Z
+        left_offset = rot_matrix[:, 1] * (opening_width / 2)  # Half opening to the left
+        right_offset = rot_matrix[:, 1] * (-opening_width / 2)  # Half opening to the right
+
+        left_finger_pos = ee_pos + forward_offset + left_offset
+        right_finger_pos = ee_pos + forward_offset + right_offset
+
+        # Update finger positions
+        p.resetBasePositionAndOrientation(
+            self.gripper_visual_ids[0],
+            left_finger_pos,
+            ee_ori
+        )
+
+        p.resetBasePositionAndOrientation(
+            self.gripper_visual_ids[1],
+            right_finger_pos,
+            ee_ori
+        )

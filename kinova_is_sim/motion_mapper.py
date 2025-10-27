@@ -10,76 +10,61 @@ from scipy.spatial.transform import Rotation
 class SimpleMotionMapper:
     """Simple direct pose mapping from Vision Pro to Kinova robot."""
 
-    def __init__(self, position_scale=0.5, workspace_offset=None):
+    def __init__(self, robot_workspace_min=None, robot_workspace_max=None):
         """
-        Initialize the motion mapper.
+        Initialize the motion mapper with calibration support.
 
         Args:
-            position_scale: Scale factor for position mapping (default: 0.5)
-                           e.g., hand moves 1m -> robot moves 0.5m
-            workspace_offset: Offset to center of robot workspace [x, y, z]
-                             (default: [0.5, 0.3, 0.5])
+            robot_workspace_min: Robot workspace minimum [x, y, z] (default: [0.2, -0.3, 0.2])
+            robot_workspace_max: Robot workspace maximum [x, y, z] (default: [0.8, 0.3, 0.8])
         """
         self.control_enabled = False
-        self.speed_scale = 1.0
-        self.position_scale = position_scale
-        self.workspace_offset = workspace_offset if workspace_offset is not None else np.array([0.5, 0.3, 0.5])
-
-        # For detecting pinch events (state tracking)
-        self.last_left_pinch = False
-        self.last_right_pinch = False
-
-        # Fine control mode
         self.fine_control_mode = False
 
-    def detect_fist(self, finger_matrices):
+        # Calibration (hand workspace boundaries)
+        self.hand_min = None  # Will be set during calibration
+        self.hand_max = None
+        self.calibrated = False
+
+        # Robot workspace
+        self.robot_min = robot_workspace_min if robot_workspace_min is not None else np.array([0.2, -0.3, 0.2])
+        self.robot_max = robot_workspace_max if robot_workspace_max is not None else np.array([0.8, 0.3, 0.8])
+
+    def set_calibration_point(self, point_name, hand_position):
         """
-        Detect if hand is making a fist.
+        Set a calibration boundary point.
 
         Args:
-            finger_matrices: (25, 4, 4) array of finger joint transforms
-
-        Returns:
-            bool: True if hand is in fist pose
+            point_name: 'x_max', 'x_min', 'y_max', 'y_min', 'z_max', 'z_min'
+            hand_position: [x, y, z] hand position at boundary
         """
-        # Simple heuristic: check if finger tips are close to palm
-        # Finger tips are at indices: 4, 9, 14, 19, 24
-        finger_tip_indices = [4, 9, 14, 19, 24]
-        wrist_pos = finger_matrices[0, :3, 3]  # Wrist position
+        if self.hand_min is None:
+            self.hand_min = hand_position.copy()
+        if self.hand_max is None:
+            self.hand_max = hand_position.copy()
 
-        distances = []
-        for idx in finger_tip_indices:
-            tip_pos = finger_matrices[idx, :3, 3]
-            dist = np.linalg.norm(tip_pos - wrist_pos)
-            distances.append(dist)
+        if 'x_max' in point_name:
+            self.hand_max[0] = hand_position[0]
+        elif 'x_min' in point_name:
+            self.hand_min[0] = hand_position[0]
+        elif 'y_max' in point_name:
+            self.hand_max[1] = hand_position[1]
+        elif 'y_min' in point_name:
+            self.hand_min[1] = hand_position[1]
+        elif 'z_max' in point_name:
+            self.hand_max[2] = hand_position[2]
+        elif 'z_min' in point_name:
+            self.hand_min[2] = hand_position[2]
 
-        # If average distance is small, it's a fist
-        avg_distance = np.mean(distances)
-        return avg_distance < 0.1  # 10cm threshold
-
-    def detect_open_hand(self, finger_matrices):
-        """
-        Detect if hand is fully open (emergency stop gesture).
-
-        Args:
-            finger_matrices: (25, 4, 4) array of finger joint transforms
-
-        Returns:
-            bool: True if hand is fully open
-        """
-        # Check if all fingers are extended
-        finger_tip_indices = [4, 9, 14, 19, 24]
-        wrist_pos = finger_matrices[0, :3, 3]
-
-        distances = []
-        for idx in finger_tip_indices:
-            tip_pos = finger_matrices[idx, :3, 3]
-            dist = np.linalg.norm(tip_pos - wrist_pos)
-            distances.append(dist)
-
-        # If average distance is large, hand is open
-        avg_distance = np.mean(distances)
-        return avg_distance > 0.15  # 15cm threshold
+    def finish_calibration(self):
+        """Mark calibration as complete."""
+        if self.hand_min is not None and self.hand_max is not None:
+            self.calibrated = True
+            print(f"✓ Calibration complete")
+            print(f"  Hand workspace: {self.hand_min} to {self.hand_max}")
+            print(f"  Robot workspace: {self.robot_min} to {self.robot_max}")
+        else:
+            print("✗ Calibration failed: boundaries not set")
 
     def rotation_matrix_to_quaternion(self, rotation_matrix):
         """
@@ -111,92 +96,44 @@ class SimpleMotionMapper:
 
     def map_to_robot(self, vp_data):
         """
-        Map Vision Pro data to robot command.
+        Map Vision Pro hand position to robot command using calibration.
 
         Args:
-            vp_data: Dictionary containing Vision Pro tracking data:
-                - 'right_wrist': (1, 4, 4) transformation matrix
-                - 'left_wrist': (1, 4, 4) transformation matrix
-                - 'right_fingers': (25, 4, 4) finger joint matrices
-                - 'left_fingers': (25, 4, 4) finger joint matrices
-                - 'right_pinch_distance': float
-                - 'left_pinch_distance': float
+            vp_data: Dictionary with 'right_wrist' (1,4,4) and 'right_pinch_distance'
 
         Returns:
-            dict or None: Robot command dictionary with:
-                - 'position': [x, y, z] target position
-                - 'orientation': [x, y, z, w] quaternion
-                - 'gripper': float 0.0-1.0 (0=closed, 1=open)
-                - 'speed_scale': float
-            Returns None if control is disabled.
-            Returns {'emergency_stop': True} if emergency stop is detected.
+            dict or None: Robot command with 'position', 'orientation', 'gripper'
         """
-
-        # === Left hand gesture detection ===
-        left_pinch = vp_data['left_pinch_distance'] < 0.02  # 2cm threshold
-        left_fist = self.detect_fist(vp_data['left_fingers'])
-        left_open = self.detect_open_hand(vp_data['left_fingers'])
-
-        # Detect pinch event (edge trigger)
-        left_pinch_event = left_pinch and not self.last_left_pinch
-        self.last_left_pinch = left_pinch
-
-        # Toggle control on/off with left hand pinch
-        if left_pinch_event:
-            self.control_enabled = not self.control_enabled
-            print(f"Control {'ENABLED' if self.control_enabled else 'DISABLED'}")
-
-        # Emergency stop with left hand open
-        if left_open:
-            print("EMERGENCY STOP - Left hand open detected!")
-            return {"emergency_stop": True}
-
-        # Return None if control is not enabled
-        if not self.control_enabled:
+        if not self.control_enabled or not self.calibrated:
             return None
 
-        # Fine control mode (left fist)
-        if left_fist:
-            if not self.fine_control_mode:
-                print("Fine control mode ENABLED")
-                self.fine_control_mode = True
-            self.speed_scale = 0.3
-            self.position_scale = 0.2
+        # Get right hand position and orientation
+        right_wrist = vp_data['right_wrist'][0]
+        hand_pos = right_wrist[:3, 3]
+        hand_rot = right_wrist[:3, :3]
+
+        # Normalize hand position to [0, 1] based on calibration
+        normalized = (hand_pos - self.hand_min) / (self.hand_max - self.hand_min + 1e-6)
+        normalized = np.clip(normalized, 0.0, 1.0)
+
+        # Map to robot workspace
+        target_position = self.robot_min + normalized * (self.robot_max - self.robot_min)
+
+        # Orientation (absolute)
+        target_orientation = self.rotation_matrix_to_quaternion(hand_rot)
+
+        # Gripper control
+        right_pinch = vp_data['right_pinch_distance']
+        if right_pinch < 0.02:
+            gripper = 0.0
+        elif right_pinch > 0.05:
+            gripper = 1.0
         else:
-            if self.fine_control_mode:
-                print("Fine control mode DISABLED")
-                self.fine_control_mode = False
-            self.speed_scale = 1.0
-            self.position_scale = 0.5
+            gripper = (right_pinch - 0.02) / 0.03
 
-        # === Right hand position mapping ===
-        right_wrist = vp_data['right_wrist'][0]  # Shape: (4, 4)
-        right_wrist_pos = right_wrist[:3, 3]  # Extract position [x, y, z]
-
-        # Apply scaling and offset
-        target_position = right_wrist_pos * self.position_scale + self.workspace_offset
-
-        # === Right hand orientation mapping ===
-        right_wrist_rotation = right_wrist[:3, :3]  # Extract 3x3 rotation matrix
-        target_orientation = self.rotation_matrix_to_quaternion(right_wrist_rotation)
-
-        # === Gripper mapping (right hand pinch) ===
-        right_pinch_dist = vp_data['right_pinch_distance']
-
-        if right_pinch_dist < 0.02:
-            gripper_command = 0.0  # Fully closed
-        elif right_pinch_dist > 0.05:
-            gripper_command = 1.0  # Fully open
-        else:
-            # Linear interpolation between closed and open
-            gripper_command = (right_pinch_dist - 0.02) / 0.03
-
-        # Assemble robot command
-        robot_command = {
+        return {
             "position": target_position,
-            "orientation": target_orientation,  # Quaternion [x, y, z, w]
-            "gripper": gripper_command,
-            "speed_scale": self.speed_scale
+            "orientation": target_orientation,
+            "gripper": gripper,
+            "speed_scale": 0.5 if self.fine_control_mode else 1.0
         }
-
-        return robot_command
